@@ -1,0 +1,29 @@
+# EyeconBumps Web App Backend - Requirements
+# Python 3.11+ compatible
+# Install with: pip install -r requirements.txt
+
+# FastAPI & Server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Authentication
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.6
+
+# Data validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Telegram Bot (python-telegram-bot)
+python-telegram-bot>=21.0
+
+# Telegram Client (Telethon) - pinned to 1.34.0 for GetForumTopicsRequest support
+telethon==1.34.0
+
+# Async & HTTP (let pip resolve versions)
+aiohttp
+httpx
+
+# APScheduler (for background tasks)
+apscheduler>=3.10.0
