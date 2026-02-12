@@ -46,6 +46,27 @@ class UpdateAccountRequest(BaseModel):
 class AssignAccountRequest(BaseModel):
     client_id: Optional[int] = None  # None = unassign
 
+class LogBotRequest(BaseModel):
+    client_id: int
+    bot_token: str
+    target_id: str
+    is_active: bool = True
+
+class ResolveIdRequest(BaseModel):
+    username: str
+    bot_token: str
+
+class CreateOrderRequest(BaseModel):
+    product_name: str
+    client_id: Optional[int] = None
+    notes: Optional[str] = None
+
+class UpdateOrderRequest(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    product_name: Optional[str] = None
+    client_id: Optional[int] = None
+
 # ============ DASHBOARD ============
 
 @router.get("/dashboard")
@@ -1471,9 +1492,93 @@ async def get_template(template_id: int, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Template not found")
     return {"template": template}
 
-@router.delete("/templates/{template_id}")
-async def delete_template(template_id: int, admin: dict = Depends(require_admin)):
-    """Delete a message template."""
     if not db.delete_template(template_id):
         raise HTTPException(status_code=404, detail="Template not found")
     return {"message": "Template deleted"}
+
+# ============ LOG BOTS ============
+
+@router.get("/log-bots")
+async def get_log_bots(admin: dict = Depends(require_admin)):
+    """Get all log bot configurations."""
+    bots = db.get_all_log_bots()
+    return {"bots": bots}
+
+@router.post("/log-bots")
+async def save_log_bot(data: LogBotRequest, admin: dict = Depends(require_admin)):
+    """Save/update log bot config."""
+    success = db.save_log_bot(data.client_id, data.bot_token, data.target_id, data.is_active)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to save log bot")
+    return {"message": "Log bot saved"}
+
+@router.delete("/log-bots/{client_id}")
+async def delete_log_bot(client_id: int, admin: dict = Depends(require_admin)):
+    """Delete log bot config."""
+    success = db.delete_log_bot(client_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Log bot not found")
+    return {"message": "Log bot deleted"}
+
+@router.post("/resolve-id")
+async def resolve_telegram_id(data: ResolveIdRequest, admin: dict = Depends(require_admin)):
+    """Resolve username to ID using the provided bot token."""
+    import httpx
+    
+    # Ensure username has @
+    username = data.username
+    if not username.startswith("@") and not username.lstrip("-").isdigit():
+        username = f"@{username}"
+        
+    url = f"https://api.telegram.org/bot{data.bot_token}/getChat"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json={"chat_id": username})
+            result = response.json()
+            
+            if not result.get("ok"):
+                raise HTTPException(status_code=400, detail=f"Telegram Error: {result.get('description')}")
+            
+            chat = result["result"]
+            return {
+                "id": str(chat["id"]),
+                "type": chat["type"],
+                "title": chat.get("title") or chat.get("username") or "Unknown"
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============ ORDERS ============
+
+@router.get("/orders")
+async def get_orders(admin: dict = Depends(require_admin)):
+    """Get all orders."""
+    orders = db.get_all_orders()
+    return {"orders": orders}
+
+@router.post("/orders")
+async def create_order(data: CreateOrderRequest, admin: dict = Depends(require_admin)):
+    """Create a new order."""
+    order = db.create_order(data.product_name, data.client_id, data.notes)
+    if not order:
+        raise HTTPException(status_code=500, detail="Failed to create order")
+    return {"message": "Order created", "order": order}
+
+@router.put("/orders/{order_id}")
+async def update_order(order_id: str, data: UpdateOrderRequest, admin: dict = Depends(require_admin)):
+    """Update an order."""
+    updates = data.model_dump(exclude_unset=True)
+    success = db.update_order(order_id, **updates)
+    if not success:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {"message": "Order updated"}
+
+@router.delete("/orders/{order_id}")
+async def delete_order(order_id: str, admin: dict = Depends(require_admin)):
+    """Delete an order."""
+    success = db.delete_order(order_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {"message": "Order deleted"}

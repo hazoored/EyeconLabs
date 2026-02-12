@@ -239,6 +239,20 @@ class Database:
             except:
                 pass
             
+            # Log bots configuration for real-time Telegram logs
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS log_bots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id INTEGER UNIQUE NOT NULL,
+                    bot_token TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+                )
+            """)
+            
             # Broadcast logs for detailed tracking
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS broadcast_logs (
@@ -250,11 +264,25 @@ class Database:
                     status TEXT,
                     error_message TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE,
-                    FOREIGN KEY (account_id) REFERENCES client_accounts(id) ON DELETE SET NULL,
                     FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
                 )
             """)
+
+            # Orders table for tracking services
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id TEXT UNIQUE NOT NULL,
+                    client_id INTEGER,
+                    product_name TEXT NOT NULL,
+                    status TEXT DEFAULT 'submitted',
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders (order_id)")
             
             # Add created_at to broadcast_logs if it doesn't exist
             try:
@@ -881,6 +909,126 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM message_templates WHERE id = ?", (template_id,))
             return cursor.rowcount > 0
+
+    # ============ LOG BOT METHODS ============
+    
+    def get_all_log_bots(self) -> List[Dict[str, Any]]:
+        """Get all log bot configurations with client names."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT lb.*, c.name as client_name 
+                FROM log_bots lb
+                JOIN clients c ON lb.client_id = c.id
+                ORDER BY lb.created_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def save_log_bot(self, client_id: int, bot_token: str, target_id: str, is_active: bool = True) -> bool:
+        """Save or update a log bot configuration."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO log_bots (client_id, bot_token, target_id, is_active, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    bot_token = excluded.bot_token,
+                    target_id = excluded.target_id,
+                    is_active = excluded.is_active,
+                    updated_at = excluded.updated_at
+            """, (client_id, bot_token, target_id, 1 if is_active else 0, datetime.now().isoformat()))
+            return cursor.rowcount > 0
+
+    def delete_log_bot(self, client_id: int) -> bool:
+        """Remove a log bot configuration."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM log_bots WHERE client_id = ?", (client_id,))
+            return cursor.rowcount > 0
+
+    def get_log_bot_by_client(self, client_id: int) -> Optional[Dict[str, Any]]:
+        """Get log bot config for a specific client."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM log_bots WHERE client_id = ?", (client_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    # ============ ORDER METHODS ============
+
+    def get_all_orders(self) -> List[Dict[str, Any]]:
+        """Get all orders with client names."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT o.*, c.name as client_name 
+                FROM orders o
+                LEFT JOIN clients c ON o.client_id = c.id
+                ORDER BY o.created_at DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+            
+    def create_order(self, product_name: str, client_id: Optional[int] = None, notes: Optional[str] = None) -> Dict[str, Any]:
+        """Create a new order."""
+        import uuid
+        order_id = str(uuid.uuid4())[:8]
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO orders (order_id, client_id, product_name, notes, status)
+                VALUES (?, ?, ?, ?, 'submitted')
+            """, (order_id, client_id, product_name, notes))
+            
+            order_db_id = cursor.lastrowid
+            
+            # Fetch created order
+            cursor.execute("""
+                SELECT o.*, c.name as client_name 
+                FROM orders o
+                LEFT JOIN clients c ON o.client_id = c.id
+                WHERE o.id = ?
+            """, (order_db_id,))
+            return dict(cursor.fetchone())
+
+    def update_order(self, order_id: str, **kwargs) -> bool:
+        """Update an order by its public order_id."""
+        valid_fields = ['status', 'notes', 'product_name', 'client_id']
+        updates = {k: v for k, v in kwargs.items() if k in valid_fields}
+        
+        if not updates:
+            return False
+            
+        updates['updated_at'] = datetime.now().isoformat()
+        
+        set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+        values = list(updates.values())
+        values.append(order_id)
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"UPDATE orders SET {set_clause} WHERE order_id = ?", tuple(values))
+            return cursor.rowcount > 0
+
+    def delete_order(self, order_id: str) -> bool:
+        """Delete an order by its public order_id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+            return cursor.rowcount > 0
+
+    def get_order_by_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Get specific order details."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT o.*, c.name as client_name 
+                FROM orders o
+                LEFT JOIN clients c ON o.client_id = c.id
+                WHERE o.order_id = ?
+            """, (order_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
 
 # Global database instance
