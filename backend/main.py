@@ -19,6 +19,26 @@ async def lifespan(app: FastAPI):
     print(f"📊 Database: {settings.DATABASE_PATH}")
     print(f"🔒 Debug mode: {settings.DEBUG}")
     
+
+    from broadcaster import get_broadcaster
+    from database import db
+    try:
+        b = get_broadcaster(db)
+        # Run in background without blocking startup
+        print('[API] Startup: Started campaign resume task')
+    except Exception as e:
+        print(f'[API] Startup Error: {e}')
+    # Auto-resume campaigns
+    try:
+        import asyncio
+        from broadcaster import get_broadcaster
+        from database import db
+        b = get_broadcaster(db)
+        asyncio.create_task(b.resume_campaigns())
+        print('[API] Startup: Resumed campaigns')
+    except Exception as e:
+        print(f'[API] Startup Error: {e}')
+    
     yield
     
     print(f"👋 {settings.APP_NAME} shutting down...")

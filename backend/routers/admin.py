@@ -46,6 +46,26 @@ class UpdateAccountRequest(BaseModel):
 class AssignAccountRequest(BaseModel):
     client_id: Optional[int] = None  # None = unassign
 
+class LogBotRequest(BaseModel):
+    client_id: int
+    bot_token: str
+    target_id: str
+    is_active: bool = True
+
+class ResolveIdRequest(BaseModel):
+    username: str
+
+class CreateOrderRequest(BaseModel):
+    product_name: str
+    client_id: Optional[int] = None
+    notes: Optional[str] = None
+
+class UpdateOrderRequest(BaseModel):
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    product_name: Optional[str] = None
+    client_id: Optional[int] = None
+
 # ============ DASHBOARD ============
 
 @router.get("/dashboard")
@@ -1128,6 +1148,9 @@ class CreateCampaignRequest(BaseModel):
     forward_link: Optional[str] = None  # t.me/c/xxx/123 format (alternative to chat/message IDs)
     account_ids: Optional[List[int]] = None  # Specific accounts to use (None = all assigned accounts)
     template_id: Optional[int] = None  # Message template ID (for premium emoji/formatting)
+    target_topic: Optional[str] = None
+    is_custom_list: bool = False
+    custom_links: Optional[str] = None
 
 class AddGroupsRequest(BaseModel):
     groups: List[str] = []  # List of group usernames or t.me links
@@ -1168,8 +1191,17 @@ async def create_campaign(data: CreateCampaignRequest, admin: dict = Depends(req
         message_content=data.message_content,
         delay_seconds=data.delay_seconds,
         account_id=account_id,
-        template_id=data.template_id
+        template_id=data.template_id,
+        target_topic=data.target_topic,
+        is_custom_list=1 if data.is_custom_list else 0
     )
+    
+    # Add groups if custom list provided
+    if data.is_custom_list and data.custom_links:
+        links = [l.strip() for l in data.custom_links.split('\n') if l.strip()]
+        if links:
+            print(f"[CAMPAIGN] Adding {len(links)} custom links to campaign")
+            db.add_campaign_groups(campaign['id'], links)
     
     # Save forward message fields and multi-account IDs
     update_data = {'id': campaign['id']}
@@ -1471,9 +1503,128 @@ async def get_template(template_id: int, admin: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Template not found")
     return {"template": template}
 
-@router.delete("/templates/{template_id}")
-async def delete_template(template_id: int, admin: dict = Depends(require_admin)):
-    """Delete a message template."""
     if not db.delete_template(template_id):
         raise HTTPException(status_code=404, detail="Template not found")
     return {"message": "Template deleted"}
+
+# ============ LOG BOTS ============
+
+@router.get("/log-bots")
+async def get_log_bots(admin: dict = Depends(require_admin)):
+    """Get all log bot configurations."""
+    bots = db.get_all_log_bots()
+    return {"bots": bots}
+
+@router.post("/log-bots")
+async def save_log_bot(data: LogBotRequest, admin: dict = Depends(require_admin)):
+    """Save/update log bot config."""
+    success = db.save_log_bot(data.client_id, data.bot_token, data.target_id, data.is_active)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to save log bot")
+    return {"message": "Log bot saved"}
+
+@router.delete("/log-bots/{client_id}")
+async def delete_log_bot(client_id: int, admin: dict = Depends(require_admin)):
+    """Delete log bot config."""
+    success = db.delete_log_bot(client_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Log bot not found")
+    return {"message": "Log bot deleted"}
+
+@router.post("/resolve-id")
+async def resolve_telegram_id(data: ResolveIdRequest, admin: dict = Depends(require_admin)):
+    """Resolve username to ID using an authenticated Telethon client with retry logic."""
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.errors import FloodWaitError
+    import os
+
+    MAX_RETRIES = 3
+    last_error = "No active accounts with valid sessions found."
+
+    for attempt in range(MAX_RETRIES):
+        # Get a random active account from the DB
+        account = db.get_random_active_account()
+        if not account or not account.get("session_string"):
+            last_error = "No active accounts with session strings available to perform the lookup."
+            break # No more accounts to try
+
+        session_string = account["session_string"]
+        account_id = account["id"]
+        API_ID = int(os.getenv("TELEGRAM_API_ID", "21219293"))
+        API_HASH = os.getenv("TELEGRAM_API_HASH", "cff5d321b676104840cf282a742381e0")
+
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                # This session is bad. Deactivate the account and try another.
+                db.update_account(account_id, is_active=False)
+                last_error = f"Session for account {account_id} is invalid. Deactivating it and trying another."
+                await client.disconnect()
+                continue # Go to the next iteration of the loop
+
+            # Session is good, proceed with resolving the username
+            username_to_resolve = data.username
+            entity = await client.get_entity(username_to_resolve)
+            
+            title = entity.first_name or ""
+            if entity.last_name:
+                title += f" {entity.last_name}"
+            title = title.strip() or entity.username or "Unknown"
+
+            return {
+                "id": str(entity.id),
+                "type": "user" if getattr(entity, 'is_user', True) else "channel",
+                "title": title
+            }
+
+        except (ValueError, TypeError):
+            # Username not found. This is a final error, no need to retry.
+            raise HTTPException(status_code=404, detail=f"Entity not found: Could not find the user/channel '{data.username}'.")
+        except FloodWaitError as e:
+            # Flood wait is a final error for this request.
+            raise HTTPException(status_code=429, detail=f"Flood wait error from Telegram: Please wait {e.seconds} seconds.")
+        except Exception as e:
+            # For other connection errors, log it and try the next account.
+            last_error = f"Error with account {account_id}: {str(e)}"
+            continue
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
+    # If the loop finished without a successful return, raise an exception with the last error
+    raise HTTPException(status_code=400, detail=last_error)
+# ============ ORDERS ============
+
+@router.get("/orders")
+async def get_orders(admin: dict = Depends(require_admin)):
+    """Get all orders."""
+    orders = db.get_all_orders()
+    return {"orders": orders}
+
+@router.post("/orders")
+async def create_order(data: CreateOrderRequest, admin: dict = Depends(require_admin)):
+    """Create a new order."""
+    order = db.create_order(data.product_name, data.client_id, data.notes)
+    if not order:
+        raise HTTPException(status_code=500, detail="Failed to create order")
+    return {"message": "Order created", "order": order}
+
+@router.put("/orders/{order_id}")
+async def update_order(order_id: str, data: UpdateOrderRequest, admin: dict = Depends(require_admin)):
+    """Update an order."""
+    updates = data.model_dump(exclude_unset=True)
+    success = db.update_order(order_id, **updates)
+    if not success:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {"message": "Order updated"}
+
+@router.delete("/orders/{order_id}")
+async def delete_order(order_id: str, admin: dict = Depends(require_admin)):
+    """Delete an order."""
+    success = db.delete_order(order_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return {"message": "Order deleted"}

@@ -70,8 +70,7 @@ class CreateClientCampaignRequest(BaseModel):
     message_type: str = "text"
     delay_seconds: int = 30
     template_id: Optional[int] = None  # Use saved template
-    account_ids: Optional[List[int]] = None
-    target_topic: Optional[str] = None  # Multiple accounts for campaign
+    account_ids: Optional[List[int]] = None  # Multiple accounts for campaign
 
 @router.post("/campaigns")
 async def create_campaign(data: CreateClientCampaignRequest, current_user: dict = Depends(require_client)):
@@ -103,8 +102,7 @@ async def create_campaign(data: CreateClientCampaignRequest, current_user: dict 
         message_content=data.message_content,
         delay_seconds=data.delay_seconds,
         account_id=account_id,
-        template_id=data.template_id,
-        target_topic=data.target_topic
+        template_id=data.template_id
     )
     
     # If multiple accounts, store the account IDs with the campaign

@@ -1,4 +1,3 @@
-from log_service import log_service
 """
 EyeconBumps Web App - Broadcasting Engine
 Handles message sending to Telegram groups with smart rate limiting
@@ -7,7 +6,7 @@ import asyncio
 import random
 import re
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Callable
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -23,6 +22,8 @@ from telethon.tl.types import (
 from telethon.errors import (
     FloodWaitError, 
     ChatWriteForbiddenError,
+    UserDeactivatedError,
+    AuthKeyUnregisteredError,
     ChannelPrivateError,
     SlowModeWaitError,
     UserBannedInChannelError,
@@ -31,7 +32,70 @@ from telethon.errors import (
     PeerIdInvalidError,
     RPCError
 )
+from log_service import log_service
 
+
+
+def normalize_topic_name(name: str) -> str:
+    """
+    Normalize topic name for robust matching.
+    Removes emojis, special chars, and converts to lowercase.
+    """
+    if not name:
+        return ""
+    # Remove emojis and special chars, keep alphanumeric and spaces
+    clean = re.sub(r'[^\w\s]', '', name).lower().strip()
+    return clean
+
+def get_target_topic_id(topics: List, target_topic: str) -> Optional[int]:
+    """
+    Find the best matching topic ID for a target topic name using robust matching.
+    """
+    if not target_topic:
+        return None
+        
+    target_clean = normalize_topic_name(target_topic)
+    
+    # Map common aliases to canonical names
+    aliases = {
+        'instagram': ['ig', 'insta', 'instagram'],
+        'whatsapp': ['wa', 'wp', 'whatsapp', 'whats app'],
+        'telegram': ['tg', 'tele', 'telegram'],
+        'snapchat': ['sc', 'snap', 'snapchat'],
+        'facebook': ['fb', 'facebook', 'meta'],
+        'twitter/x': ['x', 'twitter', 'tw', 'twitterx'],
+        'youtube': ['yt', 'youtube'],
+        'discord': ['dc', 'discord'],
+        'tiktok': ['tt', 'tiktok', 'tik tok'],
+        'other': ['other', 'others', 'general', 'chat', 'discussion']
+    }
+    
+    # 1. Exact match (case-insensitive)
+    for t in topics:
+        if t.title.lower() == target_topic.lower():
+            return t.id
+            
+    # 2. Normalized match
+    for t in topics:
+        if normalize_topic_name(t.title) == target_clean:
+            return t.id
+            
+    # 3. Alias match
+    # Find which canonical category the target belongs to
+    target_canonical = None
+    for canonical, variations in aliases.items():
+        if target_clean in variations or target_topic.lower() in variations:
+            target_canonical = canonical
+            break
+            
+    if target_canonical:
+        for t in topics:
+            t_clean = normalize_topic_name(t.title)
+            # Check if topic title matches any alias of the target category
+            if t_clean in aliases[target_canonical]:
+                return t.id
+                
+    return None
 
 def convert_entities_to_telethon(json_entities: list) -> list:
     """
@@ -91,12 +155,14 @@ def convert_entities_to_telethon(json_entities: list) -> list:
 
 class BroadcastResult:
     """Result of a single broadcast attempt."""
-    def __init__(self, group: str, status: str, error: str = None, message_link: str = None):
+    def __init__(self, group: str, status: str, error: str = None, message_id: int = None, peer_id: int = None):
         self.group = group
         self.status = status  # 'sent', 'failed', 'skipped', 'flood_wait'
         self.error = error
-        self.message_link = message_link
+        self.message_id = message_id
+        self.peer_id = peer_id
         self.timestamp = datetime.now()
+
 
 class AccountWorker:
     """
@@ -218,82 +284,112 @@ class Broadcaster:
             "status": "idle"
         })
     
-    async def get_all_dialogs(self, session_string: str) -> List[Dict[str, Any]]:
-        """
-        Fetch all dialogs (groups/channels) for an account with timeout protection.
-        """
-        print(f"[GET_DIALOGS] Starting fetch...")
+    
+    async def check_spambot_restriction(self, client, account_id):
+        """Check @SpamBot for account restrictions and update DB."""
         try:
-            # Enforce 30s timeout
-            return await asyncio.wait_for(self._get_dialogs_internal(session_string), timeout=30.0)
-        except asyncio.TimeoutError:
-            print(f"[GET_DIALOGS] TIMEOUT: Fetch took too long (>30s)")
-            return []
+            from telethon.tl.functions.messages import GetHistoryRequest
+            from datetime import timedelta
+            import asyncio
+            
+            # Start chat with @SpamBot
+            spambot = await client.get_input_entity('SpamBot')
+            await client.send_message(spambot, '/start')
+            await asyncio.sleep(2) # Wait for reply
+            
+            # Fetch last 5 messages from @SpamBot to avoid greeting race condition
+            history = await client(GetHistoryRequest(
+                peer=spambot,
+                limit=5,
+                offset_date=None,
+                offset_id=0,
+                max_id=0,
+                min_id=0,
+                add_offset=0,
+                hash=0
+            ))
+            
+            if not history.messages:
+                return None
+                
+            # Check all recent messages for the status
+            combined_text = " ".join([m.message for m in history.messages if m.message]).lower()
+            
+            good_patterns = ["no limits", "good news", "your account is free", "not limited", "no violations"]
+            if any(p in combined_text for p in good_patterns):
+                return None
+                
+            # Try to parse expiry date (Check each message for the date pattern)
+            import dateparser
+            for m in history.messages:
+                if not m.message: continue
+                # Pattern: "limited until 14 Feb 2026, 15:30 UTC"
+                match = re.search(r'until (.*?) UTC', m.message)
+                if match:
+                    try:
+                        expiry = dateparser.parse(match.group(1))
+                        if expiry: return expiry
+                    except: pass
+            
+            if "limited" in combined_text or "i’m afraid" in combined_text:
+                # detected limit but no date found
+                return datetime.now() + timedelta(days=1)
+                
+            return None
         except Exception as e:
-            print(f"[GET_DIALOGS] ERROR: {e}")
-            return []
+            print(f"[SPAMBOT] Error checking restriction for account {account_id}: {e}")
+            return None
 
-    async def _get_dialogs_internal(self, session_string: str) -> List[Dict[str, Any]]:
+    async def get_all_dialogs(self, session_string: str, client: TelegramClient = None) -> List[Dict[str, Any]]:
+        """
+        Get all groups/channels/supergroups from an account.
+        """
+        if not session_string: return []
+        local_client = False
         try:
-            client = TelegramClient(
-                StringSession(session_string),
-                self.API_ID,
-                self.API_HASH
-            )
-            print("[GET_DIALOGS] Connecting...")
-            await client.connect()
-            
-            if not await client.is_user_authorized():
-                print("[GET_DIALOGS] User not authorized")
-                await client.disconnect()
-                return []
-            
-            print("[GET_DIALOGS] Fetching dialogs...")
-            # Limit to 500 to prevent massive hangs on huge accounts
+            if not client:
+                from telethon import TelegramClient
+                from telethon.sessions import StringSession
+                client = TelegramClient(StringSession(session_string), self.API_ID, self.API_HASH)
+                await client.connect()
+                local_client = True
+            if not await client.is_user_authorized(): return []
             dialogs = []
-            async for dialog in client.iter_dialogs(limit=500):
-                # Only include groups and channels
+            async for dialog in client.iter_dialogs():
                 if dialog.is_group or dialog.is_channel:
                     entity = dialog.entity
-                    is_forum = getattr(entity, 'forum', False)
-                    
                     dialogs.append({
                         "id": dialog.id,
                         "name": dialog.name or str(dialog.id),
                         "username": getattr(entity, 'username', None),
                         "is_channel": dialog.is_channel,
                         "is_group": dialog.is_group,
-                        "is_forum": is_forum,
+                        "is_forum": getattr(entity, 'forum', False),
                         "unread_count": dialog.unread_count
                     })
-            
-            print(f"[GET_DIALOGS] Found {len(dialogs)} groups/channels")
-            await client.disconnect()
             return dialogs
-            
         except Exception as e:
-            print(f"[GET_DIALOGS] Internal Error: {e}")
-            try:
-                await client.disconnect()
-            except:
-                pass
-            raise e
-
+            print(f"[GET_DIALOGS] Error: {e}")
+            return []
+        finally:
+            if local_client and client:
+                try: await client.disconnect()
+                except: pass
     async def forward_to_group(
         self,
         client: TelegramClient,
         group,  # Can be entity, id, or username
-        from_chat: int,
-        message_id: int
+        forward_from_chat: int,
+        message_id: int,
+        from_username: str = None,  # Add username for fallback resolution
+        target_topic: str = None
     ) -> BroadcastResult:
         """
         Forward a message to a group (matches original adbot implementation).
         """
         import random
         from telethon.tl.functions.messages import ForwardMessagesRequest
-        from telethon.tl.functions.channels import GetForumTopicsRequest
-        from telethon.tl.types import ForumTopic
-
+        
         try:
             # Get the target entity
             try:
@@ -329,14 +425,38 @@ class Broadcaster:
                 # If we can't check slow mode, continue anyway
                 print(f"[FORWARD] Could not pre-check slow mode: {e}")
             
-            # Try to access source to verify permissions
-            try:
-                await client.get_entity(from_chat)
-            except:
+            # Resolve the source entity
+            source_entity = None
+            
+            # PRIORITIZE USERNAME if available - checks cache or fetches fresh
+            if from_username:
                 try:
-                    await client.get_messages(from_chat, limit=1)
-                except:
-                    return BroadcastResult(str(group), 'failed', 'Cannot access forward source')
+                    print(f"[FORWARD] Resolving source via username: {from_username}")
+                    source_entity = await client.get_entity(from_username)
+                    from_chat = source_entity # Use the actual entity object for forwarding!
+                    print(f"[FORWARD] Resolved source: {source_entity.id}")
+                except Exception as e:
+                    print(f"[FORWARD] Username resolution failed: {e}")
+
+            # Fallback to ID resolution if username failed or wasn't provided
+            if not source_entity:
+                try:
+                    # Ensure from_chat is an integer if it looks like one
+                    if isinstance(from_chat, str) and (from_chat.startswith('-100') or from_chat.lstrip('-').isdigit()):
+                        from_chat = int(from_chat)
+                    
+                    # Try to resolve but don't fail if we can't - forward_messages might still work
+                    try:
+                        source_entity = await client.get_entity(from_chat)
+                    except:
+                        # Try getting messages to seed the cache
+                        try:
+                            await client.get_messages(from_chat, limit=1)
+                            source_entity = await client.get_entity(from_chat)
+                        except:
+                            print(f"[FORWARD] Could not verify source {from_chat}, attempting forward anyway...")
+                except Exception as e:
+                    print(f"[FORWARD] Source check warning: {e}")
             
             # Check if it's a forum
             is_forum = getattr(entity, 'forum', False)
@@ -349,32 +469,43 @@ class Broadcaster:
                         offset_date=None,
                         offset_id=0,
                         offset_topic=0,
-                        limit=20  # Fetch more to find an open topic
+                        limit=100
                     ))
                     
-                    # First try to find an open General topic
+                    # FALLBACK CHAIN: Target -> Other -> General -> First Available
+                    potential_topics = []
                     for topic in topics.topics:
                         if isinstance(topic, ForumTopic):
-                            is_closed = getattr(topic, 'closed', False)
-                            if not is_closed and (topic.title.lower() == 'general' or topic.id == 1):
-                                topic_id = topic.id
-                                print(f"[FORWARD] Using open General topic {topic_id}")
+                            if not getattr(topic, 'closed', False):
+                                potential_topics.append(topic)
+                    
+                    if not potential_topics:
+                        return BroadcastResult(str(group), 'failed', 'All forum topics closed')
+
+                    # 1. Try specific target
+                    if target_topic:
+                        for t in potential_topics:
+                            if t.title.lower() == target_topic.lower():
+                                topic_id = t.id
                                 break
                     
-                    # If General is closed, find any open topic
+                    # 2. Try "Other"
                     if not topic_id:
-                        for topic in topics.topics:
-                            if isinstance(topic, ForumTopic):
-                                is_closed = getattr(topic, 'closed', False)
-                                if not is_closed:
-                                    topic_id = topic.id
-                                    print(f"[FORWARD] General closed, using open topic {topic_id}: {topic.title}")
-                                    break
+                        for t in potential_topics:
+                            if t.title.lower() == 'other':
+                                topic_id = t.id
+                                break
                     
-                    # All topics are closed
+                    # 3. Try "General" or ID 1
                     if not topic_id:
-                        print(f"[FORWARD] All topics closed for {group_id}")
-                        return BroadcastResult(str(group), 'failed', 'All forum topics closed')
+                        for t in potential_topics:
+                            if t.title.lower() == 'general' or t.id == 1:
+                                topic_id = t.id
+                                break
+                    
+                    # 4. Try first available
+                    if not topic_id:
+                        topic_id = potential_topics[0].id
                         
                 except Exception as e:
                     print(f"[FORWARD] Could not get topics: {e}")
@@ -382,47 +513,69 @@ class Broadcaster:
             
             # Forward the message - match original adbot exactly
             sent_msg = None
-            if topic_id:
-                # For forums: use ForwardMessagesRequest with top_msg_id (same as original adbot)
-                result = await client(ForwardMessagesRequest(
-                    from_peer=from_chat,
-                    id=[message_id],  # Must be a list
-                    to_peer=entity,
-                    top_msg_id=topic_id,
-                    random_id=[random.randint(0, 2**63 - 1)]
-                ))
-                # Get message from result
-                if hasattr(result, 'updates') and result.updates:
-                    for update in result.updates:
-                        if hasattr(update, 'message') and hasattr(update.message, 'id'):
-                            sent_msg = update.message
-                            break
-                print(f"[FORWARD] Forum: forwarded to {entity.id} topic {topic_id}")
-            else:
-                # For regular groups: use simple forward_messages (same as original adbot)
-                sent_msg = await client.forward_messages(entity, message_id, from_chat)
-                if isinstance(sent_msg, list):
-                    sent_msg = sent_msg[0] if sent_msg else None
-                print(f"[FORWARD] Regular: forwarded to {entity.id}")
-            
-            # Capture message link
-            message_link = None
-            if sent_msg and hasattr(sent_msg, 'id'):
-                p_id = str(entity.id).replace("-100", "")
-                if getattr(entity, 'username', None):
-                    message_link = f"https://t.me/{entity.username}/{sent_msg.id}"
+            try:
+                if topic_id:
+                    # For forums: use ForwardMessagesRequest with top_msg_id (same as original adbot)
+                    result = await client(ForwardMessagesRequest(
+                        from_peer=from_chat,
+                        id=[message_id],  # Must be a list
+                        to_peer=entity,
+                        top_msg_id=topic_id,
+                        random_id=[random.randint(0, 2**63 - 1)]
+                    ))
+                    # Get message from result
+                    if hasattr(result, 'updates') and result.updates:
+                        for update in result.updates:
+                            if hasattr(update, 'message') and hasattr(update.message, 'id'):
+                                sent_msg = update.message
+                                break
+                    print(f"[FORWARD] Forum: forwarded to {entity.id} topic {topic_id}")
                 else:
-                    message_link = f"https://t.me/c/{p_id}/{sent_msg.id}"
-
+                    # For regular groups: use simple forward_messages (same as original adbot)
+                    sent_msg = await client.forward_messages(entity, message_id, from_chat)
+                    if isinstance(sent_msg, list):
+                        sent_msg = sent_msg[0] if sent_msg else None
+                    print(f"[FORWARD] Regular: forwarded to {entity.id}")
+            except Exception as fe:
+                print(f"[FORWARD] Forward failed, attempting COPY fallback: {fe}")
+                # FALLBACK: Copy text and send if forward fails (Resilience)
+                try:
+                    # Fetch message content
+                    msg = await client.get_messages(from_chat, ids=message_id)
+                    if msg:
+                        text = msg.text
+                        entities = msg.entities
+                        if topic_id:
+                            sent_msg = await client.send_message(
+                                entity, text, formatting_entities=entities, reply_to=topic_id
+                            )
+                        else:
+                            sent_msg = await client.send_message(
+                                entity, text, formatting_entities=entities
+                            )
+                        print(f"[FORWARD] COPY fallback successful")
+                    else:
+                        raise fe # Re-raise if we can't even get the message
+                except Exception as ce:
+                    print(f"[FORWARD] COPY fallback failed: {ce}")
+                    raise fe # Raise original error
+            
             group_name = group.get('name', str(group)) if isinstance(group, dict) else str(group)
-            return BroadcastResult(group_name, 'sent', message_link=message_link)
+            msg_id = sent_msg.id if sent_msg else None
+            return BroadcastResult(group_name, 'sent', message_id=msg_id, peer_id=entity.id)
             
         except FloodWaitError as e:
             return BroadcastResult(str(group), 'flood_wait', f'Wait {e.seconds}s')
-        except (SlowModeWaitError, RPCError, Exception) as e:
+        except SlowModeWaitError as e:
+            return BroadcastResult(str(group), 'failed', f'Slow mode: {e.seconds}s')
+        except ChatWriteForbiddenError:
+            return BroadcastResult(str(group), 'failed', 'Write forbidden')
+        except UserBannedInChannelError:
+            return BroadcastResult(str(group), 'failed', 'Banned')
+        except Exception as e:
             print(f"[FORWARD] Error: {e}")
             return BroadcastResult(str(group), 'failed', str(e)[:80])
-
+    
     async def send_to_group(
         self, 
         client: TelegramClient, 
@@ -433,16 +586,14 @@ class Broadcaster:
         forward_from_chat: int = None,
         forward_message_id: int = None,
         forward_from_username: str = None,  # For public channels
-        formatting_entities: list = None  # Telethon entities for premium emoji/formatting
+        formatting_entities: list = None,  # Telethon entities for premium emoji/formatting
+        target_topic: str = None
     ) -> BroadcastResult:
         """
         Send or forward a message to a single group.
         Handles forum detection and various error cases.
         If formatting_entities provided, uses them for premium emojis/formatting.
         """
-        from telethon.tl.functions.channels import GetForumTopicsRequest
-        from telethon.tl.types import ForumTopic
-
         # Debug: Log forward mode check
         print(f"[SEND_TO_GROUP] message_type={message_type}, forward_from_chat={forward_from_chat}, forward_message_id={forward_message_id}, username={forward_from_username}")
         
@@ -465,7 +616,14 @@ class Broadcaster:
         # If forward mode
         if message_type == "forward" and forward_from_chat and forward_message_id:
             print(f"[SEND_TO_GROUP] >>> Using FORWARD mode! from_chat={forward_from_chat}, msg_id={forward_message_id}")
-            return await self.forward_to_group(client, group, forward_from_chat, forward_message_id)
+            return await self.forward_to_group(
+                client, 
+                group, 
+                forward_from_chat, 
+                forward_message_id, 
+                from_username=forward_from_username,
+                target_topic=target_topic
+            )
         else:
             print(f"[SEND_TO_GROUP] >>> Using SEND mode")
         
@@ -484,6 +642,37 @@ class Broadcaster:
                 return BroadcastResult(str(group), 'failed', 'Private channel')
             except Exception as e:
                 return BroadcastResult(str(group), 'failed', f'Cannot access: {str(e)[:50]}')
+            # BAN CHECK: Skip if account is banned from this group
+            account_id = getattr(client, "_account_id", None)
+            if account_id:
+                group_id_str = str(entity.id) if hasattr(entity, "id") else str(group)
+                if db.is_group_banned(account_id, group_id_str):
+                    print(f"[BROADCASTER] Skipping {group_name} - account {account_id} is banned")
+                    return BroadcastResult(group_name, "skipped", "Account banned from group")
+
+            
+            # PRE-FILTER: Check if we have permission to send messages
+            try:
+                # Check if messages are restricted for regular users
+                default_banned = getattr(entity, 'default_banned_rights', None)
+                if default_banned and getattr(default_banned, 'send_messages', False):
+                    # Check if we have admin rights that override
+                    admin_rights = getattr(entity, 'admin_rights', None)
+                    if not admin_rights:
+                        return BroadcastResult(group_name, 'skipped', 'No posting permission')
+                
+                # Check if we're explicitly banned from sending
+                banned_rights = getattr(entity, 'banned_rights', None)
+                if banned_rights and getattr(banned_rights, 'send_messages', False):
+                    return BroadcastResult(group_name, 'skipped', 'Banned from posting')
+            except Exception as perm_err:
+                # If permission check fails, continue and try to send anyway
+                print(f"[BROADCASTER] Permission check failed for {group_name}: {perm_err}")
+            
+            # PRE-FILTER: Check for slow mode
+            slowmode_seconds = getattr(entity, 'slowmode_seconds', 0)
+            if slowmode_seconds and slowmode_seconds > 0:
+                return BroadcastResult(group_name, 'skipped', f'Slow mode: {slowmode_seconds}s')
             
             # Check if it's a forum
             is_forum = getattr(entity, 'forum', False)
@@ -500,21 +689,44 @@ class Broadcaster:
                         limit=100  # Get more topics
                     ))
                     
-                    # Send to each topic
+                    # FALLBACK CHAIN: Target -> Other -> General -> First Available
+                    potential_topics = []
                     for topic in topics.topics:
-                        if not isinstance(topic, ForumTopic):
-                            continue
+                        if isinstance(topic, ForumTopic):
+                            if not getattr(topic, 'closed', False):
+                                potential_topics.append(topic)
+                    
+                    if not potential_topics:
+                        return BroadcastResult(group_name, 'failed', 'All forum topics closed')
+
+                    # 1. Try specific target with robust matching
+                    target_topic_id = get_target_topic_id([t for t in topics.topics if isinstance(t, ForumTopic)], target_topic)
+                    
+                    # 2. Try "Other" or "General" if target not found
+                    if not target_topic_id:
+                        target_topic_id = get_target_topic_id([t for t in topics.topics if isinstance(t, ForumTopic)], "Other")
+                    
+                    if not target_topic_id:
+                        # Try finding a topic with ID 1 (General usually)
+                        for t in topics.topics:
+                            if isinstance(t, ForumTopic) and t.id == 1:
+                                target_topic_id = 1
+                                break
+                    
+                    # 3. Fallback to first available
+                    if not target_topic_id and potential_topics:
+                        target_topic_id = potential_topics[0].id
                         
-                        # Skip closed topics
-                        if getattr(topic, 'closed', False):
-                            continue
-                        
-                        topic_name = f"{group_name} > {topic.title}"
-                        
-                        try:
-                            sent_msg = None
-                            if media_file_id:
-                                sent_msg = await client.send_file(
+                    topic_id = target_topic_id
+                    # Send to the chosen topic (Legacy note: User said "Send to ALL topics" before, 
+                    # but now wants robust logic for choosing a target)
+                    topic = next((t for t in potential_topics if t.id == target_topic_id), potential_topics[0])
+                    topic_name = f"{group_name} > {topic.title}"
+                    
+                    try:
+                        if media_file_id:
+                            try:
+                                await client.send_file(
                                     entity,
                                     media_file_id,
                                     caption=message,
@@ -522,44 +734,32 @@ class Broadcaster:
                                     formatting_entities=formatting_entities if formatting_entities else None,
                                     parse_mode=None if formatting_entities else 'html'
                                 )
-                            else:
-                                sent_msg = await client.send_message(
+                            except Exception as me:
+                                print(f"[BROADCASTER] Media send failed, copy fallback: {me}")
+                                await client.send_message(
                                     entity,
                                     message,
                                     reply_to=topic.id,
                                     formatting_entities=formatting_entities if formatting_entities else None,
                                     parse_mode=None if formatting_entities else 'html'
                                 )
-                            
-                            # Capture message link
-                            message_link = None
-                            if sent_msg and hasattr(sent_msg, 'id'):
-                                p_id = str(entity.id).replace("-100", "")
-                                if getattr(entity, 'username', None):
-                                    message_link = f"https://t.me/{entity.username}/{sent_msg.id}"
-                                else:
-                                    message_link = f"https://t.me/c/{p_id}/{sent_msg.id}"
-
-                            results.append(BroadcastResult(topic_name, 'sent', message_link=message_link))
-                            
-                            # Small delay between topics
-                            await asyncio.sleep(2)
-                            
-                        except SlowModeWaitError as e:
-                            # Slow mode on ANY topic = skip entire forum (as skipped, not failed)
-                            results.append(BroadcastResult(group_name, 'skipped', f'Forum slow mode: {e.seconds}s'))
-                            break  # Skip remaining topics
-                        except Exception as e:
-                            results.append(BroadcastResult(topic_name, 'failed', str(e)[:50]))
-                    
-                    # Return list of results for all topics
-                    return results if results else [BroadcastResult(group_name, 'failed', 'No accessible topics')]
+                        else:
+                            await client.send_message(
+                                entity,
+                                message,
+                                reply_to=topic.id,
+                                formatting_entities=formatting_entities if formatting_entities else None,
+                                parse_mode=None if formatting_entities else 'html'
+                            )
+                        return BroadcastResult(topic_name, 'sent')
+                    except Exception as te:
+                        print(f"[BROADCASTER] Topic send error: {te}")
+                        return BroadcastResult(topic_name, 'failed', str(te)[:50])
                     
                 except Exception as e:
                     return BroadcastResult(group_name, 'failed', f'Forum error: {str(e)[:50]}')
             else:
                 # Regular group/channel - send normally
-                sent_msg = None
                 if media_file_id:
                     sent_msg = await client.send_file(
                         entity,
@@ -576,242 +776,146 @@ class Broadcaster:
                         parse_mode=None if formatting_entities else 'html'
                     )
                 
-                # Capture message link
-                message_link = None
-                if sent_msg and hasattr(sent_msg, 'id'):
-                    p_id = str(entity.id).replace("-100", "")
-                    if getattr(entity, 'username', None):
-                        message_link = f"https://t.me/{entity.username}/{sent_msg.id}"
-                    else:
-                        message_link = f"https://t.me/c/{p_id}/{sent_msg.id}"
-
-                return BroadcastResult(group_name, 'sent', message_link=message_link)
+                return BroadcastResult(group_name, 'sent', message_id=sent_msg.id, peer_id=entity.id)
             
         except FloodWaitError as e:
             return BroadcastResult(str(group), 'flood_wait', f'Wait {e.seconds}s')
-        except Exception as e:
-            return BroadcastResult(str(group), 'failed', str(e)[:80])
-
-    async def _account_worker_task(
-        self,
-        worker: AccountWorker,
-        campaign: Dict[str, Any],
-        campaign_id: int,
-        message_content: str,
-        template_entities,
-        db
-    ) -> Dict[str, Any]:
-        """
-        Run broadcasting for a single account.
-        This runs independently and concurrently with other account workers.
-        """
-        results = {"sent": 0, "failed": 0, "account_id": worker.account_id, "phone": worker.phone}
-        
-        worker.status = "fetching_groups"
-        
-        # Fetch this account's dialogs (groups it's joined)
-        try:
-            groups = await self.get_all_dialogs(worker.session_string)
-        except Exception as e:
-            print(f"[WORKER {worker.phone}] Error fetching groups: {e}")
-            worker.status = "error"
-            return results
-        # TARGET TOPIC FILTERING (PARALLEL) - RELAXED
-        target_topic = campaign.get('target_topic')
-        if target_topic and groups:
-            print(f"[WORKER {worker.phone}] Topic filter skipped to prevent empty groups (Target: {target_topic})")
-            # We skip strict filtering so campaign doesn't stop.
-            # The sending logic will handle missing topics gracefully (fallback to General).
-    
-            worker.groups = groups
-            print(f"[WORKER {worker.phone}] Found {len(groups)} groups")
-            print(f"[WORKER {worker.phone}] Error fetching groups: {e}")
-            worker.status = "error"
-            return results
-        
-        if not groups:
-            worker.status = "no_groups"
-            return results
-        
-        # Update total count in progress
-        worker.total_groups = len(groups)
-        if campaign_id in self.campaign_progress:
-            # Update overall total
-            self.campaign_progress[campaign_id]["total"] += len(groups)
-            # Update per-account total
-            if worker.account_id in self.campaign_progress[campaign_id].get("accounts", {}):
-                self.campaign_progress[campaign_id]["accounts"][worker.account_id]["total"] = len(groups)
-        
-        worker.status = "running"
-        
-        # Process each group this account has access to
-        cycle = 0
-        while not self.stop_flags.get(campaign_id, False):
-            cycle += 1
+        except SlowModeWaitError as e:
+            # Slow mode - mark as skipped so it doesn't count as failed
+            return BroadcastResult(str(group), 'skipped', f'Slow mode: {e.seconds}s')
+        except (ChatWriteForbiddenError, UserBannedInChannelError) as e:
+            # Record ban in database
+            account_id = getattr(client, "_account_id", None)
+            if account_id:
+                group_id_str = str(entity.id) if hasattr(entity, "id") else str(group)
+                db.add_group_ban(account_id, group_id_str, group_name, str(e))
+                print(f"[BROADCASTER] Recorded ban: account {account_id} from {group_name}")
             
-            # Update cycle count in progress at START of each cycle
-            # Use max() so faster workers don't get overwritten by slower workers
-            if campaign_id in self.campaign_progress:
-                current_cycle = self.campaign_progress[campaign_id].get("cycle", 1)
-                self.campaign_progress[campaign_id]["cycle"] = max(current_cycle, cycle)
-            
-            for i, group in enumerate(groups):
-                if self.stop_flags.get(campaign_id, False):
-                    break
+            try:
+                from telethon.tl.functions.channels import LeaveChannelRequest, JoinChannelRequest
                 
-                # Check if this account was removed from the campaign
-                if self.is_account_removed(campaign_id, worker.account_id):
-                    print(f"[WORKER {worker.phone}] Removed from campaign, stopping...")
-                    worker.status = "removed"
-                    return results
+                # Step 1: Leave the group
+                await client(LeaveChannelRequest(entity))
+                print(f"[BROADCASTER] Left banned group: {group}, attempting rejoin...")
                 
-                # Check if worker is limited
-                if worker.status == "limited":
-                    print(f"[WORKER {worker.phone}] Limited, pausing 10 minutes...")
-                    await asyncio.sleep(600)
-                    worker.status = "running"
-                    worker.consecutive_errors = 0
+                # Step 2: Wait a moment
+                await asyncio.sleep(2)
                 
-                # Check flood wait
-                if worker.status == "flood_wait" and worker.flood_wait_until:
-                    remaining = (worker.flood_wait_until - datetime.now()).total_seconds()
-                    if remaining > 0:
-                        print(f"[WORKER {worker.phone}] FloodWait: waiting {int(remaining)}s")
-                        await asyncio.sleep(remaining)
-                    worker.status = "running"
-                    worker.flood_wait_until = None
+                # Step 3: Rejoin the group
+                await client(JoinChannelRequest(entity))
+                print(f"[BROADCASTER] Rejoined group: {group}, retrying message...")
                 
-                group_name = group.get('name', str(group.get('id', 'Unknown'))) if isinstance(group, dict) else str(group)
-                worker.current_group_name = group_name
-                worker.current_group_index = i + 1
+                # Step 4: Wait and retry sending
+                await asyncio.sleep(1)
                 
-                # Connect and send
+                if media_file_id:
+                    sent_msg = await client.send_file(
+                        entity,
+                        media_file_id,
+                        caption=message,
+                        formatting_entities=formatting_entities if formatting_entities else None,
+                        parse_mode=None if formatting_entities else 'html'
+                    )
+                else:
+                    sent_msg = await client.send_message(
+                        entity,
+                        message,
+                        formatting_entities=formatting_entities if formatting_entities else None,
+                        parse_mode=None if formatting_entities else 'html'
+                    )
+                
+                print(f"[BROADCASTER] Retry successful after rejoin: {group}")
+                return BroadcastResult(str(group), 'sent', message_id=sent_msg.id, peer_id=entity.id)
+                
+            except Exception as rejoin_err:
+                # Even if send failed, the group is still joined - mark as such
+                print(f"[BROADCASTER] Send after rejoin failed: {rejoin_err}")
+                return BroadcastResult(str(group), 'failed', 'Rejoined - send pending')
+        except ChatAdminRequiredError:
+            return BroadcastResult(str(group), 'failed', 'Admin required')
+        except MessageTooLongError:
+            return BroadcastResult(str(group), 'failed', 'Message too long')
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check for banned in general exceptions
+            if "banned" in error_str or "forbidden" in error_str:
                 try:
-                    client = TelegramClient(
-                        StringSession(worker.session_string),
-                        self.API_ID,
-                        self.API_HASH
-                    )
-                    await client.connect()
+                    # Record ban in database
+                    account_id = getattr(client, "_account_id", None)
+                    if account_id:
+                        group_id_str = str(entity.id) if hasattr(entity, "id") else str(group)
+                        db.add_group_ban(account_id, group_id_str, group_name, error_str)
                     
-                    if not await client.is_user_authorized():
-                        worker.status = "unauthorized"
-                        await client.disconnect()
-                        break
-                    
-                    # Send message to this group
-                    result = await self.send_to_group(
-                        client=client,
-                        group=group,
-                        message=message_content,
-                        formatting_entities=template_entities,
-                        message_type=campaign.get('send_mode', 'send'),  # send_mode column: "send" or "forward"
-                        forward_from_chat=campaign.get('forward_from_chat'),
-                        forward_message_id=campaign.get('forward_message_id'),
-                        forward_from_username=campaign.get('forward_from_username')
-                    )
-                    
-                    await client.disconnect()
-                    
-                    # Process result
-                    result_list = result if isinstance(result, list) else [result]
-                    
-                    for res in result_list:
-                        if res.status == 'sent':
-                            results["sent"] += 1
-                            worker.sent += 1
-                            worker.success_count += 1
-                            
-                            # Log broadcast
-                            db.log_broadcast(
-                                campaign_id=campaign_id,
-                                account_id=worker.account_id,
-                                client_id=campaign['client_id'],
-                                group_name=res.group[:100],
-                                status='sent'
-                            )
-                            # Send to log bot
-                            if bot_token and target_id:
-                                asyncio.create_task(log_service.send_log(
-                                    bot_token, target_id, res.group[:100], 
-                                    f"{worker.phone if 'worker' in locals() else account.get('phone_number')} | {worker.account.get('display_name', '') if 'worker' in locals() else account.get('display_name', '')}", 
-                                    campaign.get('name', 'Campaign'), 
-                                    res.message_link
-                                ))
-                            
-                            delay = worker.calculate_delay(success=True)
-                            
-                        elif res.status == 'flood_wait':
-                            # Extract wait time
-                            wait_match = re.search(r'(\d+)', res.error or '')
-                            wait_time = int(wait_match.group(1)) if wait_match else 60
-                            
-                            delay = worker.calculate_delay(success=False, flood_wait=wait_time)
-                        
-                        elif res.status == 'skipped':
-                            # Pre-filtered group - no posting permission, skip quickly
-                            db.log_broadcast(
-                                campaign_id=campaign_id,
-                                account_id=worker.account_id,
-                                client_id=campaign['client_id'],
-                                group_name=res.group[:100],
-                                status='skipped',
-                                error_message=res.error
-                            )
-                            # Minimal delay for skipped groups (no actual send attempt)
-                            delay = 1
-                            
-                        else:  # Failed
-                            results["failed"] += 1
-                            worker.failed += 1
-                            
-                            db.log_broadcast(
-                                campaign_id=campaign_id,
-                                account_id=worker.account_id,
-                                client_id=campaign['client_id'],
-                                group_name=res.group[:100],
-                                status='failed',
-                                error_message=res.error
-                            )
-                            
-                            delay = worker.calculate_delay(success=False)
-                        
-                        worker.add_log(res.group, res.status, res.error)
-                    
-                    # Apply delay before next group
-                    if not self.stop_flags.get(campaign_id, False):
-                        await asyncio.sleep(delay)
-                    
-                except Exception as e:
-                    print(f"[WORKER {worker.phone}] Error: {e}")
-                    results["failed"] += 1
-                    worker.failed += 1
-                    worker.calculate_delay(success=False)
+                    from telethon.tl.functions.channels import LeaveChannelRequest
+                    await client(LeaveChannelRequest(entity))
+                    print(f"[BROADCASTER] Left banned group: {group}")
+                    return BroadcastResult(str(group), "failed", "Banned - left group")
+                except:
+                    pass
+            return BroadcastResult(str(group), "failed", str(e)[:80])
+    async def _account_worker_task(self, worker, campaign, campaign_id, message_content, template_entities, db):
+        """Run broadcasting for a single account."""
+        results = {"sent": 0, "failed": 0, "account_id": worker.account_id, "phone": worker.phone}
+        worker.status = "fetching_groups"
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        import asyncio, re; from datetime import datetime, timedelta
+        client = TelegramClient(StringSession(worker.session_string), self.API_ID, self.API_HASH)
+        try:
+            await client.connect()
+            restriction = await self.check_spambot_restriction(client, worker.account_id)
+            if restriction:
+                db.update_account(worker.account_id, restricted_until=restriction.isoformat())
+                worker.status = "restricted"; return results
+            if not await client.is_user_authorized():
+                worker.status = "session_expired"; return results
+            groups = await self.get_all_dialogs(worker.session_string, client=client)
+            if not groups:
+                worker.status = "no_groups"; return results
+            worker.groups = groups; worker.total_groups = len(groups)
+            if campaign_id in self.campaign_progress: self.campaign_progress[campaign_id]["total"] += len(groups)
+            log_bot_config = db.get_log_bot_by_client(campaign['client_id'])
+            bot_token = log_bot_config['bot_token'] if log_bot_config and log_bot_config.get('is_active') else None
+            target_id = log_bot_config['target_id'] if bot_token else None
+            worker.status = "running"; cycle = 0
+            while not self.stop_flags.get(campaign_id, False):
+                cycle += 1
+                if campaign_id in self.campaign_progress: self.campaign_progress[campaign_id]["cycle"] = max(self.campaign_progress[campaign_id].get("cycle", 1), cycle)
+                for i, group in enumerate(groups):
+                    if self.stop_flags.get(campaign_id, False): break
+                    worker.current_group_index = i + 1; worker.current_group_name = group.get('name', 'Unknown')
+                    try:
+                        result = await self.send_to_group(client=client, group=group, message=message_content, formatting_entities=template_entities, message_type=campaign.get('send_mode', 'send'), forward_from_chat=campaign.get('forward_from_chat'), forward_message_id=campaign.get('forward_message_id'), forward_from_username=campaign.get('forward_from_username'), target_topic=campaign.get('target_topic'))
+                        res_list = result if isinstance(result, list) else [result]
+                        for res in res_list:
+                            if res.status == 'sent':
+                                results["sent"] += 1; worker.sent += 1; db.log_broadcast(campaign_id, worker.account_id, campaign['client_id'], res.group[:100], 'sent')
+                                if bot_token and target_id:
+                                    p_id = str(res.peer_id).replace('-100', '').replace('-', ''); message_link = f"https://t.me/c/{p_id}/{res.message_id}"
+                                    asyncio.create_task(log_service.send_log(bot_token, target_id, res.group[:100], f"{worker.phone} | {worker.account.get('display_name', '')}", campaign.get('name', 'Campaign'), message_link))
+                                delay = worker.calculate_delay(success=True)
+                            elif res.status == 'flood_wait':
+                                m = re.search(r'(\d+)', res.error or ''); wait_time = int(m.group(1)) if m else 60
+                                delay = worker.calculate_delay(success=False, flood_wait=wait_time)
+                            else:
+                                results["failed"] += 1; worker.failed += 1; db.log_broadcast(campaign_id, worker.account_id, campaign['client_id'], res.group[:100], 'failed', res.error)
+                                delay = worker.calculate_delay(success=False)
+                            worker.add_log(res.group, res.status, res.error)
+                        if not self.stop_flags.get(campaign_id, False): await asyncio.sleep(delay)
+                    except Exception as e: print(f"[WORKER {worker.phone}] Inner error: {e}"); await asyncio.sleep(10)
+                if not self.stop_flags.get(campaign_id, False): await asyncio.sleep(600)
             
-            # Cycle complete - random 10-15 minute break before next cycle
-            if not self.stop_flags.get(campaign_id, False) and not self.is_account_removed(campaign_id, worker.account_id):
-                # Update cycle count in progress (use max to not overwrite faster workers)
-                if campaign_id in self.campaign_progress:
-                    current_cycle = self.campaign_progress[campaign_id].get("cycle", 1)
-                    self.campaign_progress[campaign_id]["cycle"] = max(current_cycle, cycle)
-                
-                cycle_pause = random.randint(600, 900)  # Random 10-15 minutes
-                pause_mins = cycle_pause // 60
-                worker.status = f"cycle_break (cycle {cycle}, next in {pause_mins}m)"
-                print(f"[WORKER {worker.phone}] Cycle {cycle} complete, taking {pause_mins} min break...")
-                
-                # Wait in chunks to check stop flag
-                pause_chunks = cycle_pause // 10
-                for _ in range(pause_chunks):
-                    if self.stop_flags.get(campaign_id, False) or self.is_account_removed(campaign_id, worker.account_id):
-                        break
-                    await asyncio.sleep(10)
-                
-                worker.status = "running"
-        
-        worker.status = "stopped"
+            # Loop finished
+            worker.status = "stopped"
+
+        except Exception as e:
+            print(f"[WORKER {worker.phone}] Fatal: {e}")
+            worker.status = "crashed"
+        finally:
+            try: await client.disconnect()
+            except: pass
+            
         return results
-    
     async def run_campaign_parallel(
         self,
         campaign_id: int,
@@ -953,10 +1057,17 @@ class Broadcaster:
         # Start progress updater
         progress_task = asyncio.create_task(update_progress())
         
-        # Launch all workers simultaneously
+        # Launch all workers simultaneously (with concurrency limit)
+        # Limit to 100 concurrent workers as requested
+        concurrency_limit = asyncio.Semaphore(100)
+        
+        async def run_worker_with_limit(w):
+            async with concurrency_limit:
+                return await self._account_worker_task(w, campaign, campaign_id, message_content, template_entities, db)
+        
         try:
             worker_tasks = [
-                self._account_worker_task(w, campaign, campaign_id, message_content, template_entities, db)
+                run_worker_with_limit(w)
                 for w in workers
             ]
             
@@ -1110,36 +1221,12 @@ class Broadcaster:
                 return {"error": f"Failed to fetch dialogs: {e}"}
             
             print(f"[BROADCASTER] Got {len(groups) if groups else 0} groups from account")
-
-        # TARGET TOPIC FILTERING
-        target_topic = campaign.get('target_topic')
-        if target_topic and groups:
-            try:
-                from groups_config import GROUPS_CONFIG, TOPIC_ALIASES
-                topic_alias = TOPIC_ALIASES.get(target_topic)
-                if topic_alias:
-                    print(f"[BROADCASTER] Filtering groups by topic: {target_topic} (Alias: {topic_alias})")
-                    filtered = []
-                    for g in groups:
-                        # Check by ID (as string) or Name
-                        g_id = str(g.get('id', ''))
-                        g_name = g.get('name', '')
-                        cfg = GROUPS_CONFIG.get(g_id) or GROUPS_CONFIG.get(g_name)
-                        if cfg and topic_alias in cfg:
-                            # Keep this group and assign topic_id for folder/topic support
-                            g['topic_id'] = cfg[topic_alias]
-                            filtered.append(g)
-                    print(f"[BROADCASTER] Topic filter applied: {len(groups)} -> {len(filtered)} groups")
-                    groups = filtered
-            except Exception as e:
-                print(f"[BROADCASTER] Error in topic filtering: {e}")
-
-        if not groups:
-            print(f"[BROADCASTER] No groups found on account!")
-            self.campaign_progress[campaign_id]["status"] = "error"
-            self.campaign_progress[campaign_id]["current_group"] = "Error: Account has no joined groups"
-            db.update_campaign_status(campaign_id, "failed")
-            return {"error": "No groups found on account"}
+            if not groups:
+                print(f"[BROADCASTER] No groups found on account!")
+                self.campaign_progress[campaign_id]["status"] = "error"
+                self.campaign_progress[campaign_id]["current_group"] = "Error: Account has no joined groups"
+                db.update_campaign_status(campaign_id, "failed")
+                return {"error": "No groups found on account"}
         
         # Get forward settings
         forward_from_chat = campaign.get('forward_from_chat')
@@ -1259,6 +1346,8 @@ class Broadcaster:
                         self.API_HASH
                     )
                     await client.connect()
+                    should_disconnect = True
+                    # client._account_id = worker.account_id  # Tracking for ban checks (worker not defined here)
                     
                     if not await client.is_user_authorized():
                         account_index += 1
@@ -1296,14 +1385,6 @@ class Broadcaster:
                                 group_name=res.group[:100],  # Use actual topic name
                                 status='sent'
                             )
-                            # Send to log bot
-                            if bot_token and target_id:
-                                asyncio.create_task(log_service.send_log(
-                                    bot_token, target_id, res.group[:100], 
-                                    f"{worker.phone if 'worker' in locals() else account.get('phone_number')} | {worker.account.get('display_name', '') if 'worker' in locals() else account.get('display_name', '')}", 
-                                    campaign.get('name', 'Campaign'), 
-                                    res.message_link
-                                ))
                             
                             # Track success streak
                             success_streak += 1
@@ -1532,28 +1613,37 @@ class Broadcaster:
         self.running_campaigns[campaign_id] = task
         return task
     
-    
+    def is_campaign_running(self, campaign_id: int) -> bool:
+        """Check if a campaign is currently running."""
+        task = self.running_campaigns.get(campaign_id)
+        return task is not None and not task.done()
+
     async def resume_campaigns(self):
-        """Resume all campaigns that are supposed to be running."""
+        """Resume all campaigns that were 'running' or 'starting'."""
+        print("[BROADCASTER] Checking for interrupted campaigns...")
         try:
+            # Query directly from DB
             campaigns = self.db.get_all_campaigns()
             count = 0
             for campaign in campaigns:
                 if campaign.get('status') in ['running', 'starting']:
                     campaign_id = campaign['id']
+                    # Verify it's not already running (unlikely on fresh start)
                     if not self.is_campaign_running(campaign_id):
-                        print(f'[BROADCASTER] Resuming campaign {campaign_id}: {campaign.get('name')}')
+                        print(f"[BROADCASTER] Resuming campaign {campaign_id}: {campaign.get('name')}")
+                        # Update status to 'starting' just in case
                         self.db.update_campaign_status(campaign_id, 'starting')
+                        # Start async
                         await self.start_campaign_async(campaign_id)
                         count += 1
+            
             if count > 0:
-                print(f'[BROADCASTER] Resumed {count} campaigns')
+                print(f"[BROADCASTER] Resumed {count} campaigns")
+            else:
+                print("[BROADCASTER] No interrupted campaigns found")
+                
         except Exception as e:
-            print(f'[BROADCASTER] Error resuming campaigns: {e}')
-    def is_campaign_running(self, campaign_id: int) -> bool:
-        """Check if a campaign is currently running."""
-        task = self.running_campaigns.get(campaign_id)
-        return task is not None and not task.done()
+            print(f"[BROADCASTER] Error resuming campaigns: {e}")
 
 
 # Global broadcaster instance

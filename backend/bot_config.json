@@ -1,0 +1,13 @@
+{
+  "welcome_message": "👋 **Welcome to EyeconBumps Manager!**\n\n🤖 I'm here to help you manage your campaigns and settings.\n\nPlease choose an option below:",
+  "buttons": [
+    {
+      "label": "📊 View Dashboard",
+      "callback_data": "view_dashboard"
+    },
+    {
+      "label": "⚙️ Settings",
+      "callback_data": "settings"
+    }
+  ]
+}

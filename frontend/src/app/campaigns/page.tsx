@@ -42,7 +42,8 @@ export default function ClientCampaignsPage() {
         message_content: "",
         delay_seconds: 30,
         template_id: 0,
-        account_ids: [] as number[]  // Changed to array for multi-select
+        account_ids: [] as number[],
+        target_topic: ""
     });
 
     useEffect(() => {
@@ -79,14 +80,15 @@ export default function ClientCampaignsPage() {
                 message_content: newCampaign.message_content,
                 delay_seconds: newCampaign.delay_seconds,
                 template_id: newCampaign.template_id || null,
-                account_ids: newCampaign.account_ids.length > 0 ? newCampaign.account_ids : null
+                account_ids: newCampaign.account_ids.length > 0 ? newCampaign.account_ids : null,
+                target_topic: newCampaign.target_topic || null
             },
             token
         });
 
         if (response.ok) {
             setShowModal(false);
-            setNewCampaign({ name: "", message_content: "", delay_seconds: 30, template_id: 0, account_ids: [] });
+            setNewCampaign({ name: "", message_content: "", delay_seconds: 300, template_id: 0, account_ids: [], target_topic: "" });
             fetchData(token);
         } else {
             alert(response.error || "Failed to create campaign");
@@ -347,6 +349,28 @@ export default function ClientCampaignsPage() {
                                 </div>
                             )}
 
+                            
+                            {/* Target Topic Selection */}
+                            <div>
+                                <label style={{ display: "block", fontSize: "0.875rem", color: "#9ca3af", marginBottom: "0.5rem" }}>Select Topic</label>
+                                <select
+                                    value={newCampaign.target_topic}
+                                    onChange={(e) => setNewCampaign({ ...newCampaign, target_topic: e.target.value })}
+                                    className="input-field"
+                                >
+                                    <option value="">None (All groups)</option>
+                                    <option value="Instagram">Instagram</option>
+                                    <option value="Telegram">Telegram</option>
+                                    <option value="TikTok">TikTok</option>
+                                    <option value="WhatsApp">WhatsApp</option>
+                                    <option value="Snapchat">Snapchat</option>
+                                    <option value="YouTube">YouTube</option>
+                                    <option value="Discord">Discord</option>
+                                    <option value="Twitter/X">Twitter/X</option>
+                                    <option value="Others">Others</option>
+                                </select>
+                            </div>
+
                             {/* Template Selection */}
                             <div>
                                 <label style={{ display: "block", fontSize: "0.875rem", color: "#9ca3af", marginBottom: "0.5rem" }}>Message Template</label>
@@ -428,10 +452,9 @@ export default function ClientCampaignsPage() {
                                 <input
                                     type="number"
                                     value={newCampaign.delay_seconds}
-                                    onChange={(e) => setNewCampaign({ ...newCampaign, delay_seconds: parseInt(e.target.value) || 30 })}
+                                    onChange={(e) => setNewCampaign({ ...newCampaign, delay_seconds: parseInt(e.target.value) || 300 })}
                                     className="input-field"
-                                    min={5}
-                                    max={300}
+                                    min={300} max={3600}
                                 />
                             </div>
 

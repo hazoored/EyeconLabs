@@ -16,7 +16,7 @@ from config import settings
 DATABASE_LOCK = threading.Lock()
 
 class Database:
-    def __init__(self, db_path: str = "/opt/eyeconlabs/data/eyeconbumps_webapp.db"):
+    def __init__(self, db_path: str = "eyeconbumps_webapp.db"):
         self.db_path = db_path
         self._init_db()
     
@@ -485,19 +485,6 @@ class Database:
                 ORDER BY a.created_at DESC
             """)
             return [dict(row) for row in cursor.fetchall()]
-
-    def get_all_accounts_summary(self) -> List[Dict[str, Any]]:
-        """Get a summary of all accounts for display lists."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            # Note: Assumes clients table has telegram_username, which might not be the account's username
-            # This is for display purposes in the admin bot
-            cursor.execute("""
-                SELECT id, phone_number, display_name, is_premium 
-                FROM client_accounts 
-                ORDER BY id ASC
-            """)
-            return [dict(row) for row in cursor.fetchall()]
     
     def get_account_by_id(self, account_id: int) -> Optional[Dict[str, Any]]:
         """Get account by ID including session string."""
@@ -510,20 +497,6 @@ class Database:
             """, (account_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
-
-    def get_random_active_account(self) -> Optional[Dict[str, Any]]:
-        """Get a random, active account with a session string to use for operations."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, session_string 
-                FROM client_accounts 
-                WHERE is_active = 1 AND session_string IS NOT NULL AND session_string != ''
-                ORDER BY RANDOM() 
-                LIMIT 1
-            """)
-            row = cursor.fetchone()
-            return dict(row) if row else None
     
     def delete_account(self, account_id: int) -> bool:
         """Delete an account."""
@@ -534,29 +507,35 @@ class Database:
     
     # ============ CAMPAIGN METHODS ============
     
-    def create_campaign(self, client_id: int, name: str, target_groups: List[str] = None,
+    def create_campaign(self, client_id: int, name: str, target_groups: list = None,
                        message_type: str = "text", message_content: str = None,
-                       delay_seconds: int = 30, account_id: int = None, template_id: int = None, target_topic: str = None, is_custom_list: int = 0) -> Dict[str, Any]:
-        """Create a new campaign with optional specific account and message template."""
+                       delay_seconds: int = 3600, account_id: int = None, template_id: int = None,
+                       target_topic: str = None, is_custom_list: bool = False,
+                       account_ids: list = None) -> dict:
+        """Create a new campaign with optional specific account, message template, and target topic."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO campaigns (client_id, name, target_groups, message_type, 
-                                       message_content, delay_seconds, account_id, template_id, target_topic, is_custom_list)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                       message_content, delay_seconds, account_id, template_id,
+                                       target_topic, is_custom_list, account_ids_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (client_id, name, json.dumps(target_groups or []), message_type, 
-                  message_content, delay_seconds, 
+                  message_content, max(300, delay_seconds), 
                   account_id if account_id and account_id > 0 else None,
-                  template_id if template_id and template_id > 0 else None, target_topic, is_custom_list))
+                  template_id if template_id and template_id > 0 else None,
+                  target_topic, 1 if is_custom_list else 0, json.dumps(account_ids or [])))
             return {
                 "id": cursor.lastrowid,
                 "client_id": client_id,
                 "name": name,
                 "status": "draft",
                 "account_id": account_id,
-                "template_id": template_id, "target_topic": target_topic, "is_custom_list": is_custom_list
+                "template_id": template_id,
+                "target_topic": target_topic,
+                "is_custom_list": is_custom_list
             }
-    
+
     def get_client_campaigns(self, client_id: int) -> List[Dict[str, Any]]:
         """Get all campaigns for a client."""
         with self.get_connection() as conn:
@@ -1060,3 +1039,13 @@ class Database:
 
 # Global database instance
 db = Database(settings.DATABASE_PATH)
+
+        """Remove temporary ban records older than specified days."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                DELETE FROM account_group_bans 
+                WHERE is_permanent = 0 
+                AND datetime(last_checked) < datetime('now', '-' || ? || ' days')
+            ''', (days,))
+            return cursor.rowcount

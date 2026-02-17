@@ -56,7 +56,10 @@ export default function CampaignsPage() {
     const [newCampaign, setNewCampaign] = useState({
         client_id: 0,
         name: "",
-        target_groups: "",
+        target_groups: [] as string[],
+        target_topic: "",
+        is_custom_list: false,
+        custom_links: "",
         message_type: "text",
         message_content: "",
         delay_seconds: 30,
@@ -175,17 +178,12 @@ export default function CampaignsPage() {
         const token = getToken("admin");
         if (!token) return;
 
-        const targetGroups = newCampaign.target_groups
-            .split("\n")
-            .map((g) => g.trim())
-            .filter((g) => g);
-
         // Create campaign first
         const response = await api<{ campaign: { id: number } }>("/admin/campaigns", {
             method: "POST",
             body: {
                 ...newCampaign,
-                target_groups: targetGroups,
+                target_groups: [], // We use selectedGroupFile or custom_links backend logic
             },
             token,
         });
@@ -209,7 +207,10 @@ export default function CampaignsPage() {
         setNewCampaign({
             client_id: 0,
             name: "",
-            target_groups: "",
+            target_groups: [],
+            target_topic: "",
+            is_custom_list: false,
+            custom_links: "",
             message_type: "text",
             message_content: "",
             delay_seconds: 30,
@@ -806,6 +807,8 @@ export default function CampaignsPage() {
                                     </div>
                                 </div>
 
+                                
+
                                 {/* Account Selection Section */}
                                 {newCampaign.client_id > 0 && (
                                     <div style={{
@@ -1065,23 +1068,76 @@ export default function CampaignsPage() {
                                 {/* Target Groups - Optional */}
                                 <div>
                                     <label style={{ display: "block", fontSize: "0.875rem", color: "#9ca3af", marginBottom: "0.5rem" }}>
-                                        Target Groups <span style={{ color: "#6b7280" }}>(leave empty to send to ALL)</span>
+                                        Target Groups
                                     </label>
-                                    <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
-                                        <select
-                                            value={selectedGroupFile}
-                                            onChange={(e) => setSelectedGroupFile(e.target.value)}
-                                            className="input-field"
-                                            style={{ flex: 1 }}
-                                        >
-                                            <option value="">All joined groups (auto-detect)</option>
-                                            {groupFiles.map((f) => (
-                                                <option key={f.filename} value={f.filename}>
-                                                    {f.filename} ({f.group_count} groups)
-                                                </option>
-                                            ))}
-                                        </select>
+                                    <div style={{ display: "flex", gap: "1rem", marginBottom: "0.75rem" }}>
+                                        <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", color: "white", fontSize: "0.85rem" }}>
+                                            <input
+                                                type="radio"
+                                                name="group_mode"
+                                                checked={!newCampaign.is_custom_list}
+                                                onChange={() => setNewCampaign({ ...newCampaign, is_custom_list: false })}
+                                            />
+                                            Auto-detect
+                                        </label>
+                                        <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer", color: "white", fontSize: "0.85rem" }}>
+                                            <input
+                                                type="radio"
+                                                name="group_mode"
+                                                checked={newCampaign.is_custom_list}
+                                                onChange={() => setNewCampaign({ ...newCampaign, is_custom_list: true })}
+                                            />
+                                            Custom List
+                                        </label>
                                     </div>
+
+                                    {!newCampaign.is_custom_list ? (
+                                        <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
+                                            <select
+                                                value={selectedGroupFile}
+                                                onChange={(e) => setSelectedGroupFile(e.target.value)}
+                                                className="input-field"
+                                                style={{ flex: 1 }}
+                                            >
+                                                <option value="">All joined groups (auto-detect)</option>
+                                                {groupFiles.map((f) => (
+                                                    <option key={f.filename} value={f.filename}>
+                                                        {f.filename} ({f.group_count} groups)
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                    ) : (
+                                        <textarea
+                                            value={newCampaign.custom_links}
+                                            onChange={(e) => setNewCampaign({ ...newCampaign, custom_links: e.target.value })}
+                                            className="input-field"
+                                            rows={4}
+                                            placeholder="Paste group/folder links (one per line)..."
+                                            style={{ marginBottom: "0.5rem" }}
+                                        />
+                                    )}
+                                </div>
+
+                                
+                                <div>
+                                    <label style={{ display: "block", fontSize: "0.875rem", color: "#9ca3af", marginBottom: "0.5rem" }}>Select Topic</label>
+                                    <select
+                                        value={newCampaign.target_topic}
+                                        onChange={(e) => setNewCampaign({ ...newCampaign, target_topic: e.target.value })}
+                                        className="input-field"
+                                    >
+                                        <option value="">None (All groups)</option>
+                                        <option value="Instagram">Instagram</option>
+                                        <option value="Telegram">Telegram</option>
+                                        <option value="TikTok">TikTok</option>
+                                        <option value="WhatsApp">WhatsApp</option>
+                                        <option value="Snapchat">Snapchat</option>
+                                        <option value="YouTube">YouTube</option>
+                                        <option value="Discord">Discord</option>
+                                        <option value="Twitter/X">Twitter/X</option>
+                                        <option value="Others">Others</option>
+                                    </select>
                                 </div>
 
                                 <div>
@@ -1090,10 +1146,10 @@ export default function CampaignsPage() {
                                         type="number"
                                         value={newCampaign.delay_seconds}
                                         onChange={(e) =>
-                                            setNewCampaign({ ...newCampaign, delay_seconds: parseInt(e.target.value) || 30 })
+                                            setNewCampaign({ ...newCampaign, delay_seconds: parseInt(e.target.value) || 300 })
                                         }
                                         className="input-field"
-                                        min="5"
+                                        min="300" max="3600"
                                     />
                                 </div>
 
@@ -1107,9 +1163,10 @@ export default function CampaignsPage() {
                                 </div>
                             </form>
                         </div>
-                    </div>
-                )}
-            </main>
+                    </div >
+                )
+                }
+            </main >
         </>
     );
 }
